@@ -15,10 +15,29 @@ from datetime import datetime
 import socket
 
 import pandas as pd
-from requests.exceptions import RequestException
+from requests.exceptions import RequestException, ReadTimeout
 from nba_api.stats.static import teams as teams_static
 from nba_api.stats.static import players as players_static
 import nba_api.stats.endpoints as endpoints_module
+from nba_api.stats.library.http import NBAStatsHTTP
+
+NBAStatsHTTP.READ_TIMEOUT    = 60  # seconds
+NBAStatsHTTP.CONNECT_TIMEOUT = 30
+
+
+MAX_RETRIES = 5
+RETRY_DELAY = 5  # seconds
+
+def retry(fn, *args, **kwargs):
+    for i in range(1, MAX_RETRIES+1):
+        try:
+            return fn(*args, **kwargs)
+        except ReadTimeout:
+            print(f"⚠️ leaguegamefinder timeout {i}/{MAX_RETRIES}, retrying in {RETRY_DELAY}s…")
+            time.sleep(RETRY_DELAY)
+    # last attempt (will raise if it still fails)
+    return fn(*args, **kwargs)
+
 
 # ─── DYNAMIC ENDPOINT IMPORT ─────────────────────────────────────────────────────
 ALL_ENDPOINTS = [name for _, name, _ in pkgutil.iter_modules(endpoints_module.__path__)]
@@ -107,8 +126,14 @@ def fetch_games(season):
     old_meta = pd.DataFrame(load_json(meta_fn)) if os.path.exists(os.path.join(OUT_DIR, meta_fn)) else pd.DataFrame()
 
     # fetch the latest Regular + Playoffs listings
-    reg = leaguegamefinder(season_nullable=season, season_type_nullable='Regular Season').get_data_frames()[0]
-    po  = leaguegamefinder(season_nullable=season, season_type_nullable='Playoffs').get_data_frames()[0]
+    reg = retry(lambda: leaguegamefinder(
+        season_nullable=season,
+        season_type_nullable='Regular Season'
+    ).get_data_frames()[0])
+    po = retry(lambda: leaguegamefinder(
+        season_nullable=season,
+        season_type_nullable='Playoffs'
+    ).get_data_frames()[0])
     new_meta = pd.concat([reg, po], ignore_index=True)
 
     # merge, dedupe by GAME_ID, keep the latest date info
