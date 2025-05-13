@@ -26,17 +26,20 @@ NBAStatsHTTP.CONNECT_TIMEOUT = 30
 
 
 MAX_RETRIES = 5
-RETRY_DELAY = 5  # seconds
+RETRY_DELAY = 10  # seconds
 
 def retry(fn, *args, **kwargs):
-    for i in range(1, MAX_RETRIES+1):
+    last_exc = None
+    for attempt in range(1, MAX_RETRIES+1):
         try:
             return fn(*args, **kwargs)
-        except ReadTimeout:
-            print(f"⚠️ leaguegamefinder timeout {i}/{MAX_RETRIES}, retrying in {RETRY_DELAY}s…")
+        except ReadTimeout as e:
+            last_exc = e
+            print(f"⚠️  timeout on attempt {attempt}/{MAX_RETRIES}, retrying in {RETRY_DELAY}s…")
             time.sleep(RETRY_DELAY)
-    # last attempt (will raise if it still fails)
-    return fn(*args, **kwargs)
+    # all retries exhausted
+    raise last_exc
+    
 
 
 # ─── DYNAMIC ENDPOINT IMPORT ─────────────────────────────────────────────────────
