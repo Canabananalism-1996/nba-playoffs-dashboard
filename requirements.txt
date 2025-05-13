@@ -2,3 +2,6 @@ streamlit
 pandas
 numpy
 scikit-learn
+requests
+nba.api
+altair

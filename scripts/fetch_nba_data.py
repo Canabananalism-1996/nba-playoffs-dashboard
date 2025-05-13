@@ -1,247 +1,190 @@
 #!/usr/bin/env python3
 """
-Fetch NBA data (teams, players, games, box scores) for seasons 2022 through current year.
-If the script crashes, it waits, logs the error, and restarts—picking up where it left off.
+Fetch NBA data (teams, players, games, player box scores) for seasons 2021 through current date.
+Extract traditional + advanced stats, append full stat names, and save per-season JSON incrementally.
+Supports resuming from last saved game, automatic restart on missing data, and recovers from corrupted JSON files.
 """
-
 import os
+import sys
 import time
 import json
 import traceback
+import pkgutil
+import importlib
 from datetime import datetime
+import socket
 
+import pandas as pd
+from requests.exceptions import RequestException
 from nba_api.stats.static import teams as teams_static
 from nba_api.stats.static import players as players_static
-from nba_api.stats.endpoints import leaguegamefinder, boxscoretraditionalv2
-from requests.exceptions import RequestException
+import nba_api.stats.endpoints as endpoints_module
+
+# ─── DYNAMIC ENDPOINT IMPORT ─────────────────────────────────────────────────────
+ALL_ENDPOINTS = [name for _, name, _ in pkgutil.iter_modules(endpoints_module.__path__)]
+print("Available endpoints:", ALL_ENDPOINTS)
+ENDPOINTS = {}
+for ep in ALL_ENDPOINTS:
+    try:
+        module = importlib.import_module(f"nba_api.stats.endpoints.{ep}")
+        ENDPOINTS[ep] = module
+    except ImportError:
+        continue
+
+leaguegamefinder = ENDPOINTS['leaguegamefinder'].LeagueGameFinder
+box_trad = ENDPOINTS['boxscoretraditionalv2'].BoxScoreTraditionalV2
+box_adv  = ENDPOINTS['boxscoreadvancedv2'].BoxScoreAdvancedV2
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────────
-ROOT_DIR      = os.path.dirname(os.path.abspath(__file__))
-OUT_DIR       = os.path.join(ROOT_DIR, "..", "data-raw")
-START_YEAR    = 2022
-CURRENT_YEAR  = datetime.now().year  # e.g. 2025
+ROOT_DIR     = os.path.dirname(os.path.abspath(__file__))
+OUT_DIR      = os.path.join(ROOT_DIR, '..', 'data-raw')
+START_YEAR   = 2021
+CURRENT_YEAR = datetime.now().year
+SLEEP        = 1.0   # seconds between requests
+SKIPPED_FILE = os.path.join(OUT_DIR, 'skipped_boxscores.txt')
+FATAL_LOG    = os.path.join(OUT_DIR, 'fatal_errors.log')
 
-# Generate seasons list - with logic for current year and NBA season
-# NBA seasons typically run from October to June
-current_month = datetime.now().month
-# If we're in the early months of the year (Jan-June), we're in the latter part of a season
-# If we're in the later months (July-Dec), we're in the early part of a new season
-if current_month >= 7:  # July onwards - include current year as start of season
-    SEASONS = [f"{yr}-{(yr+1)%100:02d}" for yr in range(START_YEAR, CURRENT_YEAR + 1)]
-else:  # Jan-June - don't include current year as start of season
+if datetime.now().month >= 7:
+    SEASONS = [f"{yr}-{(yr+1)%100:02d}" for yr in range(START_YEAR, CURRENT_YEAR+1)]
+else:
     SEASONS = [f"{yr}-{(yr+1)%100:02d}" for yr in range(START_YEAR, CURRENT_YEAR)]
 
-PAUSE         = 1.5   # seconds between successful calls
-SKIPPED_FILE  = os.path.join(OUT_DIR, "skipped_boxscores.txt")
-FATAL_LOG     = os.path.join(OUT_DIR, "fatal_errors.log")
-# ────────────────────────────────────────────────────────────────────────────────
-
-def ensure_dir_exists(path):
-    """Create directory if it doesn't exist"""
-    if not os.path.exists(path):
-        try:
-            os.makedirs(path, exist_ok=True)
-            print(f"Created directory: {path}")
-        except Exception as e:
-            print(f"ERROR: Could not create directory {path}: {e}")
-            raise
+# ─── HELPERS ─────────────────────────────────────────────────────────────────────
+def ensure_dir(path):
+    os.makedirs(path, exist_ok=True)
 
 
-def save_json(obj, filename):
-    """Save object as JSON to the output directory"""
-    path = os.path.join(OUT_DIR, filename)
-    with open(path, "w", encoding="utf-8") as f:
+def save_json(obj, fn):
+    path = os.path.join(OUT_DIR, fn)
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(obj, f, indent=2)
-    print(f">>> saved {filename}")
 
 
-def fetch_teams():
-    """Fetch all NBA teams"""
-    print("Fetching teams…")
-    lst = teams_static.get_teams()
-    if not lst:
-        print("WARNING: No teams data retrieved!")
-        return
-    save_json(lst, "teams.json")
-
-
-def fetch_players():
-    """Fetch all NBA players"""
-    print("Fetching players…")
-    lst = players_static.get_players()
-    if not lst:
-        print("WARNING: No players data retrieved!")
-        return
-    save_json(lst, "players.json")
-
-
-def fetch_games(season):
-    """Fetch full game metadata and unique IDs for a given season."""
-    print(f"\nFetching games for {season}…")
-    
-    # Paths
-    ids_file   = f"game_ids_{season}.json"
-    meta_file  = f"games_meta_{season}.json"
-    ids_path   = os.path.join(OUT_DIR, ids_file)
-    meta_path  = os.path.join(OUT_DIR, meta_file)
-    
-    # 1) If metadata exists, load and return IDs
-    if os.path.exists(meta_path):
-        print(f"  → Loading existing metadata for {season}")
-        games_meta = json.load(open(meta_path, 'r'))
-        game_ids   = sorted({g["GAME_ID"] for g in games_meta})
-        return game_ids
-
-    # 2) Otherwise, fetch fresh
+def load_json(fn):
+    """
+    Load a JSON file, recovering from decode errors by backing up and resetting.
+    Returns an empty list if the file is missing or corrupted.
+    """
+    path = os.path.join(OUT_DIR, fn)
+    if not os.path.exists(path):
+        return []
     try:
-        finder = leaguegamefinder.LeagueGameFinder(season_nullable=season)
-        df     = finder.get_data_frames()[0]
-        
-        if df.empty:
-            print(f"WARNING: No games found for season {season}")
-            return []
-        
-        # Convert DataFrame to list of dicts
-        games_meta = df.to_dict(orient="records")
-        # Save full metadata
-        save_json(games_meta, meta_file)
-        
-        # Extract unique IDs
-        game_ids = sorted({row["GAME_ID"] for row in games_meta})
-        save_json(game_ids, ids_file)
-        return game_ids
-
-    except Exception as e:
-        print(f"ERROR fetching games for season {season}: {e}")
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"⚠️  Corrupted JSON in '{fn}' ({e}). Backing up and starting fresh.")
+        backup = path + '.broken'
+        os.replace(path, backup)
         return []
 
 
-
-def log_skipped(game_id):
-    """Log skipped game IDs for later retry"""
-    with open(SKIPPED_FILE, "a") as f:
-        f.write(f"{game_id}\n")
+def log_skip(gid):
+    with open(SKIPPED_FILE, 'a') as f:
+        f.write(f"{gid}\n")
 
 
-def fetch_box_scores(game_ids):
-    """Fetch box scores for a list of game IDs"""
-    if not game_ids:
-        print("No game IDs provided to fetch box scores")
-        return
-        
-    print(f"Fetching box scores for {len(game_ids)} games...")
-    
-    for gid in game_ids:
-        outfile = f"boxscore_{gid}.json"
-        outpath = os.path.join(OUT_DIR, outfile)
+def restart_script():
+    """Re-executes the current Python process with the same arguments."""
+    print("🔄 No stats found — restarting script to pick up where we left off…")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
-        # Skip if already fetched
-        if os.path.exists(outpath):
-            continue
-
-        # Retry up to 3 times on any network/HTTP error
-        for attempt in range(1, 4):
-            try:
-                print(f"→ Fetching box score for game {gid} (attempt {attempt})")
-                bs = boxscoretraditionalv2.BoxScoreTraditionalV2(
-                    game_id=gid,
-                    timeout=60
-                )
-                # Get all data frames - box score traditional returns multiple tables
-                dfs = bs.get_data_frames()
-                
-                # Process and save all returned data frames 
-                result = {}
-                for i, df in enumerate(dfs):
-                    if not df.empty:
-                        result[f"table_{i}"] = df.to_dict(orient="records")
-                
-                if not result:
-                    print(f"WARNING: No box score data found for game {gid}")
-                    log_skipped(gid)
-                    break
-                    
-                save_json(result, outfile)
-                break
-            except RequestException as e:
-                wait = 10 * attempt
-                print(f"  ⚠️ Error on game {gid}: {e.__class__.__name__}. "
-                      f"Retrying in {wait}s…")
-                time.sleep(wait)
-            except Exception as e:
-                print(f"  ❌ Unexpected error on game {gid}: {e.__class__.__name__}: {str(e)}")
-                log_skipped(gid)
-                break
-        else:
-            # all attempts failed
-            print(f"❌ Skipping game {gid} after 3 failed attempts")
-            log_skipped(gid)
-
-        # pause between games
-        time.sleep(PAUSE)
+# ─── FETCH FUNCTIONS ─────────────────────────────────────────────────────────────
+def fetch_teams():
+    teams = teams_static.get_teams()
+    save_json(teams, 'teams.json')
 
 
-def process_skipped_games():
-    """Retry processing any previously skipped games"""
-    if not os.path.exists(SKIPPED_FILE):
-        return
-        
-    print("\nRetrying previously skipped games...")
-    with open(SKIPPED_FILE, 'r') as f:
-        skipped_ids = [line.strip() for line in f if line.strip()]
-    
-    if skipped_ids:
-        # Create a backup of the skipped file before clearing it
-        backup_file = f"{SKIPPED_FILE}.bak"
-        with open(backup_file, 'w') as f:
-            f.write('\n'.join(skipped_ids))
-            
-        # Clear the skipped file
-        open(SKIPPED_FILE, 'w').close()
-        
-        # Retry fetching
-        fetch_box_scores(skipped_ids)
+def fetch_players():
+    players = players_static.get_players()
+    save_json(players, 'players.json')
+
+
+def fetch_games(season):
+    meta_fn = f"games_meta_{season}.json"
+    ids_fn  = f"game_ids_{season}.json"
+    if os.path.exists(os.path.join(OUT_DIR, meta_fn)):
+        df = pd.DataFrame(load_json(meta_fn))
     else:
-        print("No skipped games to retry")
+        reg = leaguegamefinder(season_nullable=season, season_type_nullable='Regular Season').get_data_frames()[0]
+        po  = leaguegamefinder(season_nullable=season, season_type_nullable='Playoffs').get_data_frames()[0]
+        df = pd.concat([reg, po], ignore_index=True)
+        save_json(df.to_dict('records'), meta_fn)
+    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+    df = df[df['GAME_DATE'] <= datetime.now()]
+    ids = sorted(df['GAME_ID'].unique())
+    save_json(ids, ids_fn)
+    return ids
 
 
+def fetch_scores(gids):
+    records = []
+    total = len(gids)
+    for i, gid in enumerate(gids, 1):
+        print(f" Fetching game {i}/{total} ID {gid}")
+        for attempt in range(3):
+            try:
+                tdf = box_trad(game_id=gid, timeout=3).get_data_frames()[0]
+                adf = box_adv(game_id=gid, timeout=3).get_data_frames()[0]
+                m = tdf.merge(adf, on=['GAME_ID','TEAM_ABBREVIATION','PLAYER_ID','PLAYER_NAME'], suffixes=('','_ADV'))
+                records.extend(m.to_dict('records'))
+                break
+            except (RequestException, socket.timeout) as e:
+                print(f"   ⚠️ Attempt {attempt+1} failed for game {gid}: {e}")
+                time.sleep(2)
+        time.sleep(5)
+    return records
+
+# ─── MAIN ────────────────────────────────────────────────────────────────────────
 def main():
-    """Main execution function"""
-    # Ensure output directory exists
-    ensure_dir_exists(OUT_DIR)
-    
-    # 1. Teams & players
-    fetch_teams()
-    fetch_players()
+    ensure_dir(OUT_DIR)
+    print("▶️ Seasons:", SEASONS)
 
-    # 2. Games & box scores per season
+    print("⏳ Teams…"); fetch_teams(); print("✅")
+    print("⏳ Players…"); fetch_players(); print("✅")
+
     for season in SEASONS:
+        print(f"\n🔍 Season {season}")
         ids = fetch_games(season)
-        fetch_box_scores(ids)
-    
-    # 3. Retry any skipped games
-    process_skipped_games()
+        out_fn = f"player_stats_{season}.json"
 
+        existing = load_json(out_fn)
+        processed = {r['GAME_ID'] for r in existing} if existing else set()
 
-if __name__ == "__main__":
-    print(f"NBA Data Fetch - Starting at {datetime.now()}")
-    print(f"Fetching data for seasons: {', '.join(SEASONS)}")
-    print(f"Output directory: {OUT_DIR}")
-    
-    # Outer loop to catch *any* unhandled exception and restart
-    while True:
         try:
-            main()
-            print(f"✅ All data fetched successfully. Exiting at {datetime.now()}.")
-            break
-        except Exception:
-            err_txt = traceback.format_exc()
-            print(f"❌ Fatal error encountered:\n{err_txt}")
-            # Append full traceback to fatal_errors.log
-            with open(FATAL_LOG, "a", encoding="utf-8") as log:
-                log.write(f"\n---\n{datetime.now()} —\n{err_txt}\n")
-            # Wait then retry
-            backoff = 60
-            print(f"⏱ Waiting {backoff}s before restarting fetch…")
-            time.sleep(backoff)
-            print("🔄 Restarting fetch from top…")
+            with open(SKIPPED_FILE) as f:
+                skipped = {line.strip() for line in f}
+        except FileNotFoundError:
+            skipped = set()
+        processed |= skipped
+
+        to_do = [g for g in ids if g not in processed]
+        print(f"   {len(processed)} processed, {len(to_do)} to fetch")
+
+        if to_do:
+            for idx, gid in enumerate(to_do, start=1):
+                print(f"   ▶️ [{idx}/{len(to_do)}] Fetching and saving game ID {gid}")
+                recs = fetch_scores([gid])
+
+                if recs:
+                    existing.extend(recs)
+                    save_json(existing, out_fn)
+                    print(f"   💾 Saved {out_fn} ({len(existing)} total records)")
+                else:
+                    log_skip(gid)
+                    print(f"   ⚠️ No records returned for game {gid}")
+                    # immediately restart so load_json picks up next batch cleanly
+                    restart_script()
+
+            print(f"   🎯 Season {season} up-to-date ({len(existing)} total records)")
+        else:
+            print("   ✅ Season already up-to-date")
+
+    print("\n🎉 Done.")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception:
+        with open(FATAL_LOG, 'a') as f:
+            f.write(traceback.format_exc())
+        raise
