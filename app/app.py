@@ -10,7 +10,7 @@ from components.ui_views    import (
 )
 
 st.set_page_config(page_title="NBA Analytics", layout="wide")
-st.title("NBA Playoffs Analytics")
+st.title("NBA Analytics")
 
 all_games = load_all_games()
 if all_games.empty:
