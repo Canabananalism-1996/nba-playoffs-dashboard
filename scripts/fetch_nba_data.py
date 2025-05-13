@@ -102,15 +102,32 @@ def fetch_players():
 def fetch_games(season):
     meta_fn = f"games_meta_{season}.json"
     ids_fn  = f"game_ids_{season}.json"
-    if os.path.exists(os.path.join(OUT_DIR, meta_fn)):
-        df = pd.DataFrame(load_json(meta_fn))
+    # ─── always refresh your games_meta JSON ─────────────────────────────────
+    # load existing meta (if any) so we can preserve past records
+    old_meta = pd.DataFrame(load_json(meta_fn)) if os.path.exists(os.path.join(OUT_DIR, meta_fn)) else pd.DataFrame()
+
+    # fetch the latest Regular + Playoffs listings
+    reg = leaguegamefinder(season_nullable=season, season_type_nullable='Regular Season').get_data_frames()[0]
+    po  = leaguegamefinder(season_nullable=season, season_type_nullable='Playoffs').get_data_frames()[0]
+    new_meta = pd.concat([reg, po], ignore_index=True)
+
+    # merge, dedupe by GAME_ID, keep the latest date info
+    if not old_meta.empty:
+        combined = pd.concat([old_meta, new_meta], ignore_index=True)
+        df = combined.drop_duplicates(subset="GAME_ID", keep="last")
     else:
-        reg = leaguegamefinder(season_nullable=season, season_type_nullable='Regular Season').get_data_frames()[0]
-        po  = leaguegamefinder(season_nullable=season, season_type_nullable='Playoffs').get_data_frames()[0]
-        df = pd.concat([reg, po], ignore_index=True)
-        save_json(df.to_dict('records'), meta_fn)
-    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-    df = df[df['GAME_DATE'] <= datetime.now()]
+        df = new_meta
+
+    # write back your updated meta and id lists
+    # ─── convert GAME_DATE to plain strings for JSON serialization ───
+    # copy first to avoid SettingWithCopyWarning
+    df = df.copy()
+    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE']).dt.strftime('%Y-%m-%d')
+    save_json(df.to_dict('records'), meta_fn)
+        
+    # ensure GAME_DATE is string, then filter by date
+    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE']).dt.strftime('%Y-%m-%d')
+    df = df[pd.to_datetime(df['GAME_DATE']) <= datetime.now()]
     ids = sorted(df['GAME_ID'].unique())
     save_json(ids, ids_fn)
     return ids
@@ -184,6 +201,20 @@ def main():
 if __name__ == '__main__':
     try:
         main()
+        # ─── Auto-commit & push updated JSONs ─────────────────────────
+        import subprocess
+        from datetime import datetime
+
+        # Stage any changed JSONs
+        subprocess.run("git add data-raw/*.json", shell=True, check=False)
+
+        # Commit with today's date (if there’s anything new)
+        commit_msg = f"chore: auto-update NBA data {datetime.utcnow().date()}"
+        subprocess.run(f'git commit -m "{commit_msg}"', shell=True, check=False)
+
+        # Push back to main
+        subprocess.run("git push origin main", shell=True, check=False)
+
     except Exception:
         with open(FATAL_LOG, 'a') as f:
             f.write(traceback.format_exc())
