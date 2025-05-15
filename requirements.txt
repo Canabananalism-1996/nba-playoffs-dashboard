@@ -5,3 +5,5 @@ scikit-learn
 requests
 nba.api
 altair
+scipy
+matplotlib
